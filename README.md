@@ -201,14 +201,6 @@ This open-source version contains reusable pipeline code only. It does not
 include real financial documents, parsed Markdown/JSON outputs, review CSV
 files, Excel workpapers, screenshots, API keys, or private business data.
 
-## Resume Summary
-
-> Built DiligenceBinder, an AI-powered IBD workpaper automation tool that
-> converts non-standard scanned vouchers, invoices, and bank receipts into
-> structured evidence records, performs page-level LLM extraction, supports
-> human-in-the-loop review, and exports matched Excel workpaper tables for due
-> diligence workflows.
-
 ## Privacy Notice
 
 Do not commit real financial documents, extracted outputs, screenshots, review
@@ -399,12 +391,6 @@ python launcher.py
 
 当前开源版本只包含可复用的程序代码，不包含真实财务材料、解析生成的 Markdown/JSON、
 审核 CSV、Excel 底稿、截图、API Key 或任何私有业务数据。
-
-## 简历表述
-
-> 开发 DiligenceBinder，一套面向 IBD 底稿整理的 AI 证据材料结构化工具，可将非标准化
-> 扫描凭证、发票及银行水单转换为结构化证据记录，支持逐页大模型提取、人工复核修改、
-> 凭证-发票-水单匹配及 Excel 底稿表导出。
 
 ## 隐私提示
 
