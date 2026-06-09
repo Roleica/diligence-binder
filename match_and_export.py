@@ -1,30 +1,129 @@
 #!/usr/bin/env python3
-"""
-凭证匹配脚本 v2 — 新规则:
-  规则1: 假凭证剔除 (记账凭证只出现在PDF最前面, 发票/回单页面之后的凭证是假的)
-  规则2: 多发票合并 (多张发票金额之和=凭证/回单金额 → 合并标注"等")
-"""
-import csv, re, sys
+"""Match reviewed vouchers, invoices, and bank receipts into an Excel workbook."""
+
+import csv
+import re
+import sys
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
+
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
+CATEGORY_SUFFIX_RE = re.compile(r"^(\d+)(销特|销|研特|研|管特|管)$")
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+EXPENSE_CATEGORIES = (
+    ("销", "销售费用"),
+    ("研", "研发费用"),
+    ("管", "管理费用"),
+)
+
 
 def clean_amount(val):
-    if not val: return None
+    if not val:
+        return None
     s = str(val).strip()
-    s = re.sub(r'^[$￥A-Z]{1,4}\s*', '', s).replace(',', '').replace(' ', '')
-    try: return round(float(s), 2)
-    except: return None
+    s = re.sub(r"^[$￥A-Z]{1,4}\s*", "", s).replace(",", "").replace(" ", "")
+    try:
+        return round(float(s), 2)
+    except ValueError:
+        return None
 
 
 def amounts_match(a, b, tolerance=0.5):
-    if a is None or b is None or a == 0 or b == 0: return False
+    if a is None or b is None or a == 0 or b == 0:
+        return False
     diff = abs(a - b)
     return diff < tolerance or diff / max(a, b) < 0.01
+
+
+def parse_expected_voucher_no(pdf_name):
+    """Parse voucher number from names like 24060123销 -> 123."""
+    match = CATEGORY_SUFFIX_RE.match(pdf_name)
+    if not match:
+        return ""
+
+    digits = match.group(1)
+    if len(digits) >= 7:
+        return digits[4:].lstrip("0")
+
+    for vlen in (4, 3):
+        if len(digits) >= vlen + 4:
+            return digits[-vlen:].lstrip("0")
+    return ""
+
+
+def has_amount_match(voucher, invoices, banks):
+    amount = voucher.get("_金额")
+    if amount is None:
+        return False
+    return any(amounts_match(amount, inv.get("_价税合计")) for inv in invoices) or any(
+        amounts_match(amount, bank.get("_交易金额")) for bank in banks
+    )
+
+
+def is_foreign_inv(inv):
+    seller = str(inv.get("销售方名称", "") or "")
+    inv_no = str(inv.get("发票号码", "") or "")
+    inv_date = str(inv.get("开票日期", "") or "")
+    if re.search(r"[A-Za-z]{5,}", seller):
+        return True
+    if re.search(r"[A-Za-z]", inv_no) and not CJK_RE.search(inv_no):
+        return True
+    return bool(re.search(r"[A-Za-z]", inv_date))
+
+
+def is_foreign_bank(bank):
+    amount = str(bank.get("交易金额", "") or "").upper()
+    return any(marker in amount for marker in ("$", "USD", "AUD", "EUR"))
+
+
+def split_items_by_type(items):
+    return (
+        [i for i in items if i["type"] == "记账凭证"],
+        [i for i in items if i["type"] == "发票"],
+        [i for i in items if i["type"] == "银行回单"],
+    )
+
+
+def drop_blank_documents(invoices, banks):
+    invoices = [i for i in invoices if i.get("发票号码", "").strip() or i.get("价税合计", "").strip()]
+    banks = [b for b in banks if b.get("回单编号", "").strip() or b.get("交易金额", "").strip()]
+    return invoices, banks
+
+
+def dedupe_invoices(invoices):
+    seen = set()
+    deduped = []
+    for invoice in invoices:
+        key = invoice.get("发票号码", "")
+        if key and key in seen:
+            continue
+        seen.add(key)
+        deduped.append(invoice)
+    return deduped
+
+
+def build_fake_reasons(fake_vouchers, boundary, expected_vno):
+    reasons = []
+    for voucher in fake_vouchers:
+        vno = voucher.get("凭证编号", "")
+        if voucher["page"] >= boundary and boundary < 999:
+            reasons.append(vno + "(页码异常)")
+        elif expected_vno and vno and vno != expected_vno:
+            reasons.append(vno + "(编号≠" + expected_vno + ")")
+        else:
+            reasons.append(vno)
+    return reasons
+
+
+def expense_category(pdf_name):
+    for marker, category in EXPENSE_CATEGORIES:
+        if marker in pdf_name:
+            return category
+    return ""
 
 
 def read_csv(csv_path):
@@ -61,33 +160,15 @@ def read_csv(csv_path):
 
 def match_items(items):
     """新规则匹配"""
-    all_vouchers = [i for i in items if i['type'] == '记账凭证']
-    invoices = [i for i in items if i['type'] == '发票']
-    banks = [i for i in items if i['type'] == '银行回单']
+    all_vouchers, invoices, banks = split_items_by_type(items)
 
     # === 规则1: 剔除假凭证 (页码顺序 + 文件名凭证号) ===
     first_inv_page = min((i['page'] for i in invoices), default=999)
     first_bank_page = min((i['page'] for i in banks), default=999)
     boundary = min(first_inv_page, first_bank_page)
 
-    # 从文件名解析期望的凭证号: YYMM + voucher_no + category suffix.
-    # Example: 24060123销 -> 123.
     pdf_name = items[0]['pdf_name'] if items else ''
-    expected_vno = ''
-    m = re.match(r'^(\d+)(销特|销|研特|研|管特|管)$', pdf_name)
-    if m:
-        digits = m.group(1)
-        # 格式: YY + MM + 凭证号(3-5位)
-        if len(digits) >= 7:
-            # 去掉前4位(年月), 剩余就是凭证号
-            vno_part = digits[4:]
-            expected_vno = vno_part.lstrip('0')
-        else:
-            # 备选: 取最后3-5位
-            for vlen in [4, 3]:
-                if len(digits) >= vlen + 4:
-                    expected_vno = digits[-vlen:].lstrip('0')
-                    break
+    expected_vno = parse_expected_voucher_no(pdf_name)
 
     real_v, fake_v = [], []
     for v in all_vouchers:
@@ -113,16 +194,8 @@ def match_items(items):
             continue
         # 同名凭证号: 比较哪个更好
         old_v = best_by_vno[vno]
-        old_match = old_v['_金额'] and any(
-            amounts_match(old_v['_金额'], inv['_价税合计']) or
-            amounts_match(old_v['_金额'], bank['_交易金额'])
-            for inv in invoices for bank in banks
-        )
-        new_match = v['_金额'] and any(
-            amounts_match(v['_金额'], inv['_价税合计']) or
-            amounts_match(v['_金额'], bank['_交易金额'])
-            for inv in invoices for bank in banks
-        )
+        old_match = has_amount_match(old_v, invoices, banks)
+        new_match = has_amount_match(v, invoices, banks)
         if new_match and not old_match:
             fake_v.append(old_v); best_by_vno[vno] = v
         elif old_match and not new_match:
@@ -138,17 +211,8 @@ def match_items(items):
 
     vouchers = real_v
     # 清理空条目(LLM幻觉产生的空白行)
-    invoices = [i for i in invoices if i.get('发票号码', '').strip() or i.get('价税合计', '').strip()]
-    banks = [b for b in banks if b.get('回单编号', '').strip() or b.get('交易金额', '').strip()]
-    # 去重: 相同发票号只保留第一个
-    seen_inv = set()
-    deduped_inv = []
-    for inv in invoices:
-        key = inv.get('发票号码', '')
-        if key and key in seen_inv: continue
-        seen_inv.add(key)
-        deduped_inv.append(inv)
-    invoices = deduped_inv
+    invoices, banks = drop_blank_documents(invoices, banks)
+    invoices = dedupe_invoices(invoices)
 
     matched, used_v, used_i, used_b = [], set(), set(), set()
 
@@ -201,19 +265,6 @@ def match_items(items):
                     if best_i is not None: break
 
         # === 规则3: 外币/外国发票 ===
-        def is_foreign_inv(inv):
-            seller = str(inv.get('销售方名称', '') or '')
-            inv_no = str(inv.get('发票号码', '') or '')
-            inv_date = str(inv.get('开票日期', '') or '')
-            if re.search(r'[A-Za-z]{5,}', seller): return True
-            if re.search(r'[A-Za-z]', inv_no) and not re.search(r'[一-鿿]', inv_no): return True
-            if re.search(r'[A-Za-z]', inv_date): return True
-            return False
-
-        def is_foreign_bank(bank):
-            amt = str(bank.get('交易金额', '') or '')
-            return bool(re.search(r'[$USD]{1,4}', amt))
-
         # 凭证和回单匹配, 发票不匹配 → 找外币发票
         if best_b is not None and best_i is None:
             for ii, inv in enumerate(invoices):
@@ -238,16 +289,7 @@ def match_items(items):
         used_v.add(vi)
         if best_i is not None: used_i.add(best_i)
         if best_b is not None: used_b.add(best_b)
-        # 假凭证原因
-        fake_reasons = []
-        for fv in fake_v:
-            vno = fv.get('凭证编号','')
-            if fv['page'] >= boundary and boundary < 999:
-                fake_reasons.append(vno + '(页码异常)')
-            elif expected_vno and vno and vno != expected_vno:
-                fake_reasons.append(vno + '(编号≠' + expected_vno + ')')
-            else:
-                fake_reasons.append(vno)
+        fake_reasons = build_fake_reasons(fake_v, boundary, expected_vno)
 
         matched.append({
             'voucher': v, 'fake_vouchers': fake_v,
@@ -360,11 +402,7 @@ def write_gt_excel(all_matched, output_path):
             ws.cell(row=row, column=2).fill = gray
 
         # 费用类型
-        cat = ''
-        if '销' in pdf_name: cat = '销售费用'
-        elif '研' in pdf_name: cat = '研发费用'
-        elif '管' in pdf_name: cat = '管理费用'
-        ws.cell(row=row, column=16, value=cat).border = thin
+        ws.cell(row=row, column=16, value=expense_category(pdf_name)).border = thin
 
     for c, w in {1:55, 2:30, 3:30, 4:12, 5:14, 6:45, 7:16, 8:28, 9:14, 10:38, 11:18, 12:28, 13:14, 14:18, 15:12, 16:12, 17:30}.items():
         ws.column_dimensions[get_column_letter(c)].width = w

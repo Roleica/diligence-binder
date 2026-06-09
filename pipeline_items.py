@@ -61,6 +61,26 @@ def validate_api_config():
             f"缺少 API 配置: {names}. 请复制 .env.example 为 .env，或通过环境变量设置。"
         )
 
+
+def parse_model_items(raw):
+    """Extract a JSON item list from an LLM response string."""
+    try:
+        arr_match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if arr_match:
+            parsed = json.loads(arr_match.group())
+            return parsed if isinstance(parsed, list) else []
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        obj_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+        if obj_match:
+            parsed = json.loads(obj_match.group())
+            return [parsed] if isinstance(parsed, dict) else []
+    except json.JSONDecodeError:
+        pass
+    return []
+
 # ---- Prompt: 提取每页所有单据 ----
 SYSTEM_PROMPT = """你是财务文档提取专家。请从单页markdown中提取该页包含的**所有**财务单据。
 
@@ -101,24 +121,12 @@ def deepseek_extract_items(md_text, page_num, total_pages):
         "max_tokens": 1000, "temperature": 0,
     }, headers={"Authorization": f"Bearer {DS_KEY}", "Content-Type": "application/json"}, timeout=90)
     elapsed = time.time() - t0
+    resp.raise_for_status()
     data = resp.json()
     raw = data["choices"][0]["message"]["content"]
     tokens = data.get("usage", {})
 
-    # 解析 JSON 数组
-    items = []
-    try:
-        arr_match = re.search(r'\[.*\]', raw, re.DOTALL)
-        if arr_match:
-            items = json.loads(arr_match.group())
-    except json.JSONDecodeError:
-        # Try single object
-        try:
-            m = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
-            if m: items = [json.loads(m.group())]
-        except: pass
-
-    return items, elapsed, tokens, raw
+    return parse_model_items(raw), elapsed, tokens, raw
 
 
 def process_pdf(pdf_path, output_base, verbose=True):
@@ -158,6 +166,7 @@ def process_pdf(pdf_path, output_base, verbose=True):
                                       "Content-Type": "application/octet-stream"},
                              timeout=60)
         md_time = time.time() - t0
+        resp.raise_for_status()
         data = resp.json()
         if data.get("code") != 200:
             if verbose: print(f"p{page_num}:ERR ", end="", flush=True)
